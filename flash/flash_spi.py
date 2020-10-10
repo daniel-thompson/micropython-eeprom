@@ -37,7 +37,6 @@ class FLASH(FlashDevice):
         self._mvp = memoryview(self._bufp)  # cost-free slicing
         self._page_size = 256  # Write uses 256 byte pages.
 
-        self.wake()
         size = self.scan(verbose, size)
         super().__init__(block_size, len(cspins), size * 1024, sec_size)
 
@@ -52,33 +51,18 @@ class FLASH(FlashDevice):
         self.initialise()  # Initially cache sector 0
 
     # **** API SPECIAL METHODS ****
-    # release from deep power down
-    def wake(self):
-        mvp = self._mvp[:1]
-        mvp[0] = _RDP
-        for n, cs in enumerate(self._cspins):
-            cs(0)
-            self._spi.write(mvp)
-            cs(1)
-
-    # put in deep power down
-    def sleep(selfe):
-        mvp = self._mvp[:1]
-        mvp[0] = _DP
-        for n, cs in enumerate(self._cspins):
-            cs(0)
-            self._spi.write(mvp)
-            cs(1)
-
     # Scan: read manf ID
     def scan(self, verbose, size):
         mvp = self._mvp
         for n, cs in enumerate(self._cspins):
+            self._ccs = cs
+            self._wake()
             mvp[:] = b'\0\0\0\0\0\0'
             mvp[0] = _RDID
             cs(0)
             self._spi.write_readinto(mvp[:4], mvp[:4])
             cs(1)
+            self._cmd(_DP)
             scansize = 1 << (mvp[3] - 10)
             if not size:
                 size = scansize
@@ -94,15 +78,11 @@ class FLASH(FlashDevice):
     def erase(self):
         mvp = self._mvp
         for cs in self._cspins:  # For each chip
-            mvp[0] = _WREN
-            cs(0)
-            self._spi.write(mvp[:1])  # Enable write
-            cs(1)
-            mvp[0] = _CE
-            cs(0)
-            self._spi.write(mvp[:1])  # Start erase
-            cs(1)
-            self._wait_rdy()  # Wait for erase to complete
+            self._ccs = cs
+            self._wake()
+            self._cmd(_WREN)  # Enable write
+            self._cmd(_CE)  # Start erase
+            self._wait_rdy()  # Wait for erase to complete (and sleep)
 
     # **** INTERFACE FOR BASE CLASS ****
     # Write cache to a sector starting at byte address addr
@@ -116,16 +96,14 @@ class FLASH(FlashDevice):
             # write one page at a time
             self._getaddr(addr, 1)
             cs = self._ccs  # Current chip select from _getaddr
-            mvp[0] = _WREN
-            cs(0)
-            self._spi.write(mvp[:1])  # Enable write
-            cs(1)
+            self._wake()
+            self._cmd(_WREN)  # Enable write
             mvp[0] = self._cmds[_PP]
             cs(0)
             self._spi.write(mvp[:self._cmdlen])  # Start write
             self._spi.write(cache[start : start + ps])
             cs(1)
-            self._wait_rdy()  # Wait for write to complete
+            self._wait_rdy()  # Wait for write to complete (and sleep)
             nbytes -= ps
             start += ps
             addr += ps
@@ -138,11 +116,13 @@ class FLASH(FlashDevice):
         while nbytes > 0:
             npage = self._getaddr(addr, nbytes)  # No. of bytes in current chip
             cs = self._ccs
+            self._wake()
             mvp[0] = self._cmds[_READ]
             cs(0)
             self._spi.write(mvp[:self._cmdlen])
             self._spi.readinto(mvb[start : start + npage])
             cs(1)
+            self._cmd(_DP)
 #            print('addr {} npage {} data {}'.format(addr, npage, mvb[start]))
             nbytes -= npage
             start += npage
@@ -156,6 +136,19 @@ class FLASH(FlashDevice):
         return buf
 
     # **** INTERNAL METHODS ****
+    def _cmd(self, cmd):  # Send a simple one byte opcode
+        mvp = self._mvp
+        cs = self._ccs
+
+        mvp[0] = cmd
+        cs(0)
+        self._spi.write(mvp[:1])
+        cs(1)
+
+    def _wake(self):
+        self._cmd(_RDP)
+        time.sleep_us(100)
+
     def _wait_rdy(self):  # After a write, wait for device to become ready
         mvp = self._mvp
         cs = self._ccs  # Chip is already current
@@ -167,6 +160,7 @@ class FLASH(FlashDevice):
             if not (mvp[1] & 1):
                 break
             time.sleep_ms(1)
+        self._cmd(_DP)
 
     # Given an address, set current chip select and address buffer.
     # Return the number of bytes that can be processed in the current chip.
@@ -191,13 +185,11 @@ class FLASH(FlashDevice):
         if not self.is_empty(addr):
             self._getaddr(addr, 1)
             cs = self._ccs  # Current chip select from _getaddr
+            self._wake()
+            self._cmd(_WREN)  # Enable write
             mvp = self._mvp
-            mvp[0] = _WREN
-            cs(0)
-            self._spi.write(mvp[:1])  # Enable write
-            cs(1)
             mvp[0] = self._cmds[_SE]
             cs(0)
             self._spi.write(mvp[:self._cmdlen])  # Start erase
             cs(1)
-            self._wait_rdy()  # Wait for erase to complete
+            self._wait_rdy()  # Wait for erase to complete (and sleep)
